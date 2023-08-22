@@ -39,12 +39,18 @@ async fn main() -> Result<(), Error> {
     let (handler_tx, mut handler_rx) = tokio::sync::mpsc::unbounded_channel();
 
     let conn = UdpSocket::bind("0.0.0.0:8080").await?;
-    println!("Local address: {}", conn.local_addr()?);
+    let arc_conn = Arc::new(conn);
+    let arc_conn2 = arc_conn.clone();
+    println!("Local address: {}", arc_conn.local_addr()?);
+
+    println!("server ip: {}", server);
+    let len = arc_conn2.send_to(b"hello world", server).await?;
+    println!("{:?} bytes sent", len);
 
     println!("Connecting to: {stun}");
-    conn.connect(stun).await?;
+    arc_conn.connect(stun).await?;
 
-    let mut client = ClientBuilder::new().with_conn(Arc::new(conn)).build()?;
+    let mut client = ClientBuilder::new().with_conn(arc_conn).build()?;
 
     let mut msg = Message::new();
     msg.build(&[Box::<TransactionId>::default(), Box::new(BINDING_REQUEST)])?;
@@ -61,19 +67,17 @@ async fn main() -> Result<(), Error> {
     client.close().await?;
 
     // conect to server
-    println!("server ip: {}", server);
-
-    let socket = TcpSocket::new_v4()?;
-    socket.bind("0.0.0.0:8080".parse().unwrap())?;
-    socket.set_reuseaddr(true)?;
-    if let Some(mut tcp_stream) = socket.connect(server.parse().unwrap()).await.ok() {
-        tcp_stream.write_all(b"Hello server").await?;
-        tcp_stream.flush().await?;
-        let mut buffer = [0; 1024];
-        let _ = tcp_stream.read(&mut buffer).await?;
-        let message = String::from_utf8_lossy(&buffer);
-        println!("Server says: {}", message);
-    }
+    // let socket = TcpSocket::new_v4()?;
+    // socket.bind("0.0.0.0:8080".parse().unwrap())?;
+    // socket.set_reuseaddr(true)?;
+    // if let Some(mut tcp_stream) = socket.connect(server.parse().unwrap()).await.ok() {
+    //     tcp_stream.write_all(b"Hello server").await?;
+    //     tcp_stream.flush().await?;
+    //     let mut buffer = [0; 1024];
+    //     let _ = tcp_stream.read(&mut buffer).await?;
+    //     let message = String::from_utf8_lossy(&buffer);
+    //     println!("Server says: {}", message);
+    // }
 
     Ok(())
 }

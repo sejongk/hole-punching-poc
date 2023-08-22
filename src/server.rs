@@ -57,12 +57,13 @@ async fn main() -> Result<(), Error> {
     let allowed = matches.value_of("allowed").unwrap();
     let len = sock.send_to(b"hello world", allowed).await?;
 
-    println!("Sent {} bytes", len);
+    println!("allowed: {allowed}, {len}");
 
     let (handler_tx, mut handler_rx) = tokio::sync::mpsc::unbounded_channel();
 
     println!("Connecting to: {server}");
     let arc_conn = Arc::new(sock);
+    let arc_conn2 = arc_conn.clone();
 
     arc_conn.connect(server).await?;
     let mut client = ClientBuilder::new().with_conn(arc_conn).build()?;
@@ -82,17 +83,28 @@ async fn main() -> Result<(), Error> {
     client.close().await?;
 
     // open server
-    let tcp_socket = TcpSocket::new_v4()?;
-    tcp_socket.bind("0.0.0.0:8080".parse().unwrap())?;
-    tcp_socket.set_reuseaddr(true)?;
-    let listener = tcp_socket.listen(1024).unwrap();
-    println!("Listening on: {}", listener.local_addr()?);
+    // let tcp_socket = TcpSocket::new_v4()?;
+    // tcp_socket.bind("0.0.0.0:8080".parse().unwrap())?;
+    // tcp_socket.set_reuseaddr(true)?;
+    // let listener = tcp_socket.listen(1024).unwrap();
+    // println!("Listening on: {}", listener.local_addr()?);
 
-    while let Ok((mut tcp_stream, _)) = listener.accept().await {
-        let mut buffer = [0; 1024];
-        let _size = tcp_stream.read(&mut buffer).await;
-        tcp_stream.write_all(b"Hello, client").await?;
-        tcp_stream.flush().await?;
+    // while let Ok((mut tcp_stream, _)) = listener.accept().await {
+    //     let mut buffer = [0; 1024];
+    //     let _size = tcp_stream.read(&mut buffer).await;
+    //     tcp_stream.write_all(b"Hello, client").await?;
+    //     tcp_stream.flush().await?;
+    // }
+
+    println!("Listening on: {}", arc_conn2.local_addr()?);
+    let mut buf = [0; 1024];
+
+    loop {
+        let (len, addr) = arc_conn2.recv_from(&mut buf).await?;
+        println!("{:?} bytes received from {:?}", len, addr);
+
+        // let len = arc_conn2.send_to(&buf[..len], addr).await?;
+        // println!("{:?} bytes sent", len);
     }
     Ok(())
 }
