@@ -1,13 +1,18 @@
 use std::sync::Arc;
 
 use clap::{App, Arg};
+use std::net::{SocketAddr, ToSocketAddrs};
+use stun::addr::*;
 use stun::agent::*;
 use stun::client::*;
 use stun::message::*;
 use stun::xoraddr::*;
 use stun::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpSocket, UdpSocket};
+use tokio::net::{TcpSocket, TcpStream, UdpSocket};
+
+use std::io;
+use tokio::io::Interest;
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
@@ -21,11 +26,11 @@ async fn main() -> Result<(), Error> {
                 .long("fullhelp"),
         )
         .arg(
-            Arg::with_name("server")
+            Arg::with_name("stun")
                 .required_unless("FULLHELP")
                 .takes_value(true)
-                .default_value("stun.l.google.com:19302")
-                .long("server")
+                .default_value("stun.sipnet.net:3478")
+                .long("stun")
                 .help("STUN Server"),
         )
         .arg(
@@ -43,68 +48,82 @@ async fn main() -> Result<(), Error> {
         std::process::exit(0);
     }
 
-    let server = matches.value_of("server").unwrap();
-
-    // let conn = UdpSocket::bind("0.0.0.0:8080").await?;
-
-    // println!("allowed: {allowed}");
-    // let buf: [u8; 1024] = [0; 1024];
-    // let _ = conn.send_to(&buf, server);
-
-    let sock = UdpSocket::bind("0.0.0.0:8080").await?;
-    println!("Local address: {}", sock.local_addr()?);
-
+    let stun = matches.value_of("stun").unwrap();
     let allowed = matches.value_of("allowed").unwrap();
-    let len = sock.send_to(b"hello world", allowed).await?;
 
-    println!("allowed: {allowed}, {len}");
+    // stun
+    let socket = TcpSocket::new_v4()?;
+    socket.set_reuseaddr(true)?;
+    socket.bind("0.0.0.0:8080".parse().unwrap())?;
 
-    let (handler_tx, mut handler_rx) = tokio::sync::mpsc::unbounded_channel();
+    println!("Local address: {}", socket.local_addr()?);
 
-    println!("Connecting to: {server}");
-    let arc_conn = Arc::new(sock);
-    let arc_conn2 = arc_conn.clone();
-
-    arc_conn.connect(server).await?;
-    let mut client = ClientBuilder::new().with_conn(arc_conn).build()?;
-
+    let stun_addrs: Vec<SocketAddr> = stun.to_socket_addrs().unwrap().collect();
+    println!("{}", stun_addrs[0]);
+    let mut stream = socket.connect(stun_addrs[0]).await?;
     let mut msg = Message::new();
     msg.build(&[Box::<TransactionId>::default(), Box::new(BINDING_REQUEST)])?;
-
-    client.send(&msg, Some(Arc::new(handler_tx))).await?;
-
-    if let Some(event) = handler_rx.recv().await {
-        let msg = event.event_body?;
-        let mut xor_addr = XorMappedAddress::default();
-        xor_addr.get_from(&msg)?;
-        println!("Got response: {xor_addr}");
-    }
-
-    client.close().await?;
-
-    // open server
-    // let tcp_socket = TcpSocket::new_v4()?;
-    // tcp_socket.bind("0.0.0.0:8080".parse().unwrap())?;
-    // tcp_socket.set_reuseaddr(true)?;
-    // let listener = tcp_socket.listen(1024).unwrap();
-    // println!("Listening on: {}", listener.local_addr()?);
-
-    // while let Ok((mut tcp_stream, _)) = listener.accept().await {
-    //     let mut buffer = [0; 1024];
-    //     let _size = tcp_stream.read(&mut buffer).await;
-    //     tcp_stream.write_all(b"Hello, client").await?;
-    //     tcp_stream.flush().await?;
-    // }
-
-    println!("Listening on: {}", arc_conn2.local_addr()?);
-    let mut buf = [0; 1024];
+    stream.write_all(&msg.raw).await?;
 
     loop {
-        let (len, addr) = arc_conn2.recv_from(&mut buf).await?;
-        println!("{:?} bytes received from {:?}", len, addr);
+        let ready = stream
+            .ready(Interest::READABLE | Interest::WRITABLE)
+            .await?;
 
-        // let len = arc_conn2.send_to(&buf[..len], addr).await?;
-        // println!("{:?} bytes sent", len);
+        if ready.is_readable() {
+            let mut data: Vec<u8> = vec![0; 1024];
+            match stream.try_read(&mut data) {
+                Ok(n) => {
+                    println!("read {} bytes", n);
+                    match msg.unmarshal_binary(&data) {
+                        Ok(_) => {
+                            let mut xor_addr = XorMappedAddress::default();
+                            xor_addr.get_from(&msg)?;
+                            println!("Got response: {xor_addr}");
+                        }
+                        Err(_) => {
+                            println!("error!");
+                        }
+                    }
+                }
+                Err(e) => {
+                    return Err(e.into());
+                }
+            }
+            break;
+        }
     }
+
+    // allowed
+    println!("send to allowed");
+    let socket = TcpSocket::new_v4()?;
+    socket.set_reuseaddr(true)?;
+    socket.bind("0.0.0.0:8080".parse().unwrap())?;
+
+    if let Ok(_) = socket.connect(allowed.parse().unwrap()).await {
+        // Successfully connected, continue with the connection
+    } else {
+        // Ignore the "Network is unreachable" error
+        // Handle other errors if needed
+        println!("Connection failed, but ignoring the error.");
+    }
+    stream.shutdown().await?;
+
+    // open server
+    println!("open server");
+    let socket = TcpSocket::new_v4()?;
+    socket.set_reuseaddr(true)?;
+    socket.bind("0.0.0.0:8080".parse().unwrap())?;
+
+    let listener = socket.listen(1024)?;
+    println!("Listening on: {}", listener.local_addr()?);
+
+    while let Ok((mut tcp_stream, _)) = listener.accept().await {
+        let mut buffer: [u8; 1024] = [0; 1024];
+        let _size = tcp_stream.read(&mut buffer).await;
+        tcp_stream.write_all(b"Hello, client").await?;
+        tcp_stream.flush().await?;
+    }
+
     Ok(())
 }

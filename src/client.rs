@@ -1,14 +1,18 @@
 use std::sync::Arc;
 
 use clap::{App, Arg};
+use std::net::{SocketAddr, ToSocketAddrs};
+use stun::addr::*;
 use stun::agent::*;
 use stun::client::*;
 use stun::message::*;
 use stun::xoraddr::*;
 use stun::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpSocket;
-use tokio::net::UdpSocket;
+use tokio::net::{TcpSocket, TcpStream, UdpSocket};
+
+use std::io;
+use tokio::io::Interest;
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
@@ -17,67 +21,86 @@ async fn main() -> Result<(), Error> {
         .author("Rain Liu <yliu@webrtc.rs>")
         .about("An example of STUN Client")
         .arg(
+            Arg::with_name("FULLHELP")
+                .help("Prints more detailed help information")
+                .long("fullhelp"),
+        )
+        .arg(
             Arg::with_name("stun")
+                .required_unless("FULLHELP")
                 .takes_value(true)
-                .default_value("stun.l.google.com:19302")
+                .default_value("stun.sipnet.net:3478")
                 .long("stun")
                 .help("STUN Server"),
         )
         .arg(
             Arg::with_name("server")
+                .required_unless("FULLHELP")
                 .takes_value(true)
                 .long("server")
-                .help("Server"),
+                .help("TCP server"),
         );
 
     let matches = app.clone().get_matches();
 
-    let server = matches.value_of("server").unwrap();
     let stun = matches.value_of("stun").unwrap();
+    let server = matches.value_of("server").unwrap();
 
     // stun
-    let (handler_tx, mut handler_rx) = tokio::sync::mpsc::unbounded_channel();
+    let socket = TcpSocket::new_v4()?;
+    socket.set_reuseaddr(true)?;
+    socket.bind("0.0.0.0:8080".parse().unwrap())?;
 
-    let conn = UdpSocket::bind("0.0.0.0:8080").await?;
-    let arc_conn = Arc::new(conn);
-    let arc_conn2 = arc_conn.clone();
-    println!("Local address: {}", arc_conn.local_addr()?);
+    println!("Local address: {}", socket.local_addr()?);
 
-    println!("server ip: {}", server);
-    let len = arc_conn2.send_to(b"hello world", server).await?;
-    println!("{:?} bytes sent", len);
-
-    println!("Connecting to: {stun}");
-    arc_conn.connect(stun).await?;
-
-    let mut client = ClientBuilder::new().with_conn(arc_conn).build()?;
-
+    let stun_addrs: Vec<SocketAddr> = stun.to_socket_addrs().unwrap().collect();
+    println!("{}", stun_addrs[0]);
+    let mut stream = socket.connect(stun_addrs[0]).await?;
     let mut msg = Message::new();
     msg.build(&[Box::<TransactionId>::default(), Box::new(BINDING_REQUEST)])?;
+    stream.write_all(&msg.raw).await?;
 
-    client.send(&msg, Some(Arc::new(handler_tx))).await?;
+    loop {
+        let ready = stream
+            .ready(Interest::READABLE | Interest::WRITABLE)
+            .await?;
 
-    if let Some(event) = handler_rx.recv().await {
-        let msg = event.event_body?;
-        let mut xor_addr = XorMappedAddress::default();
-        xor_addr.get_from(&msg)?;
-        println!("Got response: {xor_addr}");
+        if ready.is_readable() {
+            let mut data: Vec<u8> = vec![0; 1024];
+            match stream.try_read(&mut data) {
+                Ok(n) => {
+                    println!("read {} bytes", n);
+                    match msg.unmarshal_binary(&data) {
+                        Ok(_) => {
+                            let mut xor_addr = XorMappedAddress::default();
+                            xor_addr.get_from(&msg)?;
+                            println!("Got response: {xor_addr}");
+                        }
+                        Err(_) => {
+                            println!("error!");
+                        }
+                    }
+                }
+                Err(e) => {
+                    return Err(e.into());
+                }
+            }
+            break;
+        }
     }
 
-    client.close().await?;
-
     // conect to server
-    // let socket = TcpSocket::new_v4()?;
-    // socket.bind("0.0.0.0:8080".parse().unwrap())?;
-    // socket.set_reuseaddr(true)?;
-    // if let Some(mut tcp_stream) = socket.connect(server.parse().unwrap()).await.ok() {
-    //     tcp_stream.write_all(b"Hello server").await?;
-    //     tcp_stream.flush().await?;
-    //     let mut buffer = [0; 1024];
-    //     let _ = tcp_stream.read(&mut buffer).await?;
-    //     let message = String::from_utf8_lossy(&buffer);
-    //     println!("Server says: {}", message);
-    // }
+    let socket = TcpSocket::new_v4()?;
+    socket.set_reuseaddr(true)?;
+    socket.bind("0.0.0.0:8080".parse().unwrap())?;
+    if let Some(mut tcp_stream) = socket.connect(server.parse().unwrap()).await.ok() {
+        tcp_stream.write_all(b"Hello server").await?;
+        tcp_stream.flush().await?;
+        let mut buffer = [0; 1024];
+        let _ = tcp_stream.read(&mut buffer).await?;
+        let message = String::from_utf8_lossy(&buffer);
+        println!("Server says: {}", message);
+    }
 
     Ok(())
 }
